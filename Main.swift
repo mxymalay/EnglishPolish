@@ -175,6 +175,7 @@ final class FloatingPanel: NSPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = PolishModel()
     var status: NSStatusItem!
+    var statusMessage: NSMenuItem!
     var overlay: FloatingPanel!
     var preview: NSWindow?
     var settings: NSWindow?
@@ -190,7 +191,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         status = NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName:"sparkles",accessibilityDescription:"轻语英文润色")
         let menu = NSMenu()
-        menu.addItem(item("轻语 · 英文润色",action:nil))
+        statusMessage = item(FloatingButtonStatus.starting.menuTitle,action:nil)
+        menu.addItem(statusMessage)
         menu.addItem(.separator())
         menu.addItem(item("打开润色窗口",action:#selector(manual)))
         menu.addItem(item("设置…",action:#selector(showSettings)))
@@ -250,12 +252,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func item(_ title: String, action: Selector?) -> NSMenuItem {
         let item = NSMenuItem(title:title,action:action,keyEquivalent:""); item.target = self; return item
     }
+    func updateFloatingStatus(_ status: FloatingButtonStatus) {
+        statusMessage?.title = status.menuTitle
+    }
     func tick() {
-        guard !paused, !suspended, desktopReady(), (preview?.isVisible != true || !model.lease.valid),
-              let draft = model.bridge.snapshot(),
-              !draft.identity.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else {
-            overlay.orderOut(nil); latest = nil; return
-        }
+        guard !paused else { updateFloatingStatus(.paused); overlay.orderOut(nil); latest = nil; return }
+        guard !suspended, desktopReady() else { updateFloatingStatus(.desktopUnavailable); overlay.orderOut(nil); latest = nil; return }
+        guard preview?.isVisible != true || !model.lease.valid else { updateFloatingStatus(.previewOpen); overlay.orderOut(nil); latest = nil; return }
+        let probe = model.bridge.probe()
+        updateFloatingStatus(probe.status)
+        guard let draft = probe.snapshot else { overlay.orderOut(nil); latest = nil; return }
         latest = draft
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         let point = NSPoint(x:draft.bounds.midX,y:primaryHeight-draft.bounds.midY)
@@ -289,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func togglePause(_ sender:NSMenuItem) {
         paused.toggle(); sender.title = paused ? "恢复浮动按钮" : "暂停浮动按钮"
-        if paused { overlay.orderOut(nil) }
+        if paused { overlay.orderOut(nil); updateFloatingStatus(.paused) }
     }
     @objc func quit() { NSApp.terminate(nil) }
     func windowWillClose(_ notification:Notification) {

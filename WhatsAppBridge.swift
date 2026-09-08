@@ -11,6 +11,11 @@ struct DraftSnapshot {
     let exactCharacter: Bool
 }
 
+struct DraftProbe {
+    let status: FloatingButtonStatus
+    let snapshot: DraftSnapshot?
+}
+
 final class WhatsAppBridge {
     static let bundleID = "net.whatsapp.WhatsApp"
     private func value(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
@@ -55,28 +60,36 @@ final class WhatsAppBridge {
         return rect
     }
 
-    func snapshot(requireFrontmost: Bool = true) -> DraftSnapshot? {
-        guard AXIsProcessTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier:Self.bundleID).first,
-              !app.isTerminated, !app.isHidden,
-              !requireFrontmost || NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return nil }
+    func probe(requireFrontmost: Bool = true) -> DraftProbe {
+        guard AXIsProcessTrusted() else { return DraftProbe(status:.accessibilityNeeded,snapshot:nil) }
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:Self.bundleID).first,
+              !app.isTerminated, !app.isHidden else { return DraftProbe(status:.whatsAppNotRunning,snapshot:nil) }
+        guard !requireFrontmost || NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
+            return DraftProbe(status:.whatsAppNotActive,snapshot:nil)
+        }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(axApp,0.2)
         guard let window = element(value(axApp,kAXFocusedWindowAttribute)),
-              (value(window,kAXMinimizedAttribute) as? Bool) != true else { return nil }
+              (value(window,kAXMinimizedAttribute) as? Bool) != true else { return DraftProbe(status:.noFocusedChat,snapshot:nil) }
         var budget = 250
         guard let composer = find(window,id:"ChatBar_ComposerTextView",budget:&budget),
-              let fieldRect = rect(composer) else { return nil }
+              let fieldRect = rect(composer) else { return DraftProbe(status:.composerUnavailable,snapshot:nil) }
         budget = 250
-        guard let header = find(window,id:"NavigationBar_HeaderViewButton",budget:&budget) else { return nil }
+        guard let header = find(window,id:"NavigationBar_HeaderViewButton",budget:&budget) else { return DraftProbe(status:.noFocusedChat,snapshot:nil) }
         let chat = [string(header,kAXTitleAttribute), string(header,kAXDescriptionAttribute), string(header,kAXValueAttribute)].joined(separator:"|")
-        guard !chat.replacingOccurrences(of:"|",with:"").isEmpty else { return nil }
+        guard !chat.replacingOccurrences(of:"|",with:"").isEmpty else { return DraftProbe(status:.noFocusedChat,snapshot:nil) }
         let text = string(composer,kAXValueAttribute)
+        guard !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { return DraftProbe(status:.emptyDraft,snapshot:nil) }
         let end = endRect(composer,text:text)
         // When character bounds are unavailable, place the button just above the input's right edge.
         let anchor = end.flatMap { fieldRect.intersects($0) ? $0 : nil }
         let fallback = CGRect(x:fieldRect.maxX-38,y:fieldRect.minY-38,width:0,height:0)
         let identity = DraftIdentity(window:String(CFHash(window)),chat:chat,text:text,field:String(CFHash(composer)))
-        return DraftSnapshot(identity:identity,element:composer,window:window,header:header,pid:app.processIdentifier,bounds:anchor ?? fallback,exactCharacter:anchor != nil)
+        return DraftProbe(status:.ready,snapshot:DraftSnapshot(identity:identity,element:composer,window:window,header:header,pid:app.processIdentifier,bounds:anchor ?? fallback,exactCharacter:anchor != nil))
+    }
+
+    func snapshot(requireFrontmost: Bool = true) -> DraftSnapshot? {
+        probe(requireFrontmost:requireFrontmost).snapshot
     }
 
     func replace(_ original: DraftSnapshot, with text: String) throws {

@@ -67,3 +67,33 @@ struct ReplacementLease {
     private(set) var valid = true
     mutating func observeActivation(isOwnApp: Bool) { if !isOwnApp { valid = false } }
 }
+
+enum FloatingButtonStatus: Equatable {
+    case starting
+    case paused
+    case desktopUnavailable
+    case accessibilityNeeded
+    case whatsAppNotRunning
+    case whatsAppNotActive
+    case noFocusedChat
+    case composerUnavailable
+    case emptyDraft
+    case previewOpen
+    case ready
+
+    var menuTitle: String {
+        switch self {
+        case .starting: return "轻语：正在检查 WhatsApp…"
+        case .paused: return "轻语：浮动按钮已暂停"
+        case .desktopUnavailable: return "轻语：等待可用的桌面会话"
+        case .accessibilityNeeded: return "轻语：需要辅助功能权限"
+        case .whatsAppNotRunning: return "轻语：请先打开 WhatsApp"
+        case .whatsAppNotActive: return "轻语：请先切换到 WhatsApp"
+        case .noFocusedChat: return "轻语：请先打开一个聊天"
+        case .composerUnavailable: return "轻语：未找到消息输入框"
+        case .emptyDraft: return "轻语：输入英文后显示 ✨"
+        case .previewOpen: return "轻语：润色窗口打开时隐藏 ✨"
+        case .ready: return "轻语：✨ 已显示在输入框旁"
+        }
+    }
+}
