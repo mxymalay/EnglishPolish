@@ -8,6 +8,7 @@ struct DraftSnapshot {
     let header: AXUIElement
     let pid: pid_t
     let bounds: CGRect
+    let composerBounds: CGRect
     let exactCharacter: Bool
 }
 
@@ -85,7 +86,7 @@ final class WhatsAppBridge {
         let anchor = end.flatMap { fieldRect.intersects($0) ? $0 : nil }
         let fallback = CGRect(x:fieldRect.maxX-38,y:fieldRect.minY-38,width:0,height:0)
         let identity = DraftIdentity(window:String(CFHash(window)),chat:chat,text:text,field:String(CFHash(composer)))
-        return DraftProbe(status:.ready,snapshot:DraftSnapshot(identity:identity,element:composer,window:window,header:header,pid:app.processIdentifier,bounds:anchor ?? fallback,exactCharacter:anchor != nil))
+        return DraftProbe(status:.ready,snapshot:DraftSnapshot(identity:identity,element:composer,window:window,header:header,pid:app.processIdentifier,bounds:anchor ?? fallback,composerBounds:fieldRect,exactCharacter:anchor != nil))
     }
 
     func snapshot(requireFrontmost: Bool = true) -> DraftSnapshot? {

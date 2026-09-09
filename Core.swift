@@ -21,9 +21,9 @@ struct PolishResult: Codable {
         let result: PolishResult
         do { result = try JSONDecoder().decode(Self.self, from: data) }
         catch { throw PolishError("AI 返回格式不完整，请重试。") }
-        guard (1...3).contains(result.options.count),
+        guard result.options.count == 2,
               result.options.allSatisfy({ !$0.english.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !$0.chinese.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.english.utf16.count <= 20000 }),
-              result.ambiguous ? (result.options.count >= 2 && !result.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) : result.options.count == 1
+              !result.ambiguous || !result.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { throw PolishError("AI 未给出可确认的完整表达，请重试。") }
         return result
     }
@@ -46,11 +46,33 @@ func lastCharacterRange(_ text: String) -> NSRange? {
 }
 
 enum Placement {
-    static func buttonRect(axRect: CGRect, primaryHeight: CGFloat, visible: CGRect) -> CGRect {
-        let size: CGFloat = 32
+    static func buttonRect(axRect: CGRect, composerRect: CGRect, primaryHeight: CGFloat, visible: CGRect) -> CGRect {
+        let size: CGFloat = 26
         let x = min(max(axRect.maxX + 6, visible.minX + 6), visible.maxX - size - 6)
-        let y = min(max(primaryHeight - axRect.maxY - 6, visible.minY + 6), visible.maxY - size - 6)
+        // AX coordinates start at the top. Keep the entire trigger below the composer so
+        // a downward popover cannot cover the draft text.
+        let y = min(max(primaryHeight - composerRect.maxY - size - 4, visible.minY + 6), visible.maxY - size - 6)
         return CGRect(x: x, y: y, width: size, height: size)
+    }
+
+    static func shouldOpenCandidatesBelow(anchor: CGRect, visible: CGRect, requiredHeight: CGFloat = 170) -> Bool {
+        let spaceBelow = anchor.minY - visible.minY
+        let spaceAbove = visible.maxY - anchor.maxY
+        // Prefer downward placement when it has normal dictionary-popover room.
+        // Near the bottom edge, use the roomier upper side instead.
+        return spaceBelow >= requiredHeight || spaceBelow >= spaceAbove
+    }
+
+    static func candidateRect(anchor: CGRect, contentSize: CGSize, visible: CGRect, opensBelow: Bool) -> CGRect {
+        let margin: CGFloat = 6, gap: CGFloat = 2
+        let width = min(contentSize.width, max(1,visible.width-margin*2))
+        let room = opensBelow
+            ? anchor.minY-visible.minY-gap-margin
+            : visible.maxY-anchor.maxY-gap-margin
+        let height = min(contentSize.height,max(1,room))
+        let x = min(max(anchor.midX-width/2,visible.minX+margin),visible.maxX-width-margin)
+        let y = opensBelow ? anchor.minY-gap-height : anchor.maxY+gap
+        return CGRect(x:x,y:y,width:width,height:height)
     }
 }
 

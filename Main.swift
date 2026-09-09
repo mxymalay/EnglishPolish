@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ApplicationServices
+import Combine
 
 @MainActor
 final class PolishModel: ObservableObject {
@@ -12,6 +13,7 @@ final class PolishModel: ObservableObject {
     @Published var attached = false
     @Published var completed = false
     @Published var lease = ReplacementLease()
+    @Published var pinned = false
     var snapshot: DraftSnapshot?
     var requestTask: Task<Void,Never>?
     var generation = UUID()
@@ -26,6 +28,7 @@ final class PolishModel: ObservableObject {
         snapshot = draft; attached = draft != nil
         source = draft?.identity.text ?? ""
         lease = ReplacementLease()
+        pinned = false
         result = nil; selected = nil; message = ""; completed = false
     }
     func cancel() {
@@ -36,7 +39,9 @@ final class PolishModel: ObservableObject {
         do {
             let endpoint = UserDefaults.standard.string(forKey:"endpoint") ?? "https://api.openai.com/v1"
             let model = UserDefaults.standard.string(forKey:"model") ?? ""
-            let configuration = APIConfiguration(endpoint:endpoint,model:model,key:try SecretStore.read(endpoint))
+            let casualPrompt = UserDefaults.standard.string(forKey:"casualPrompt") ?? APIClient.defaultCasualPrompt
+            let formalPrompt = UserDefaults.standard.string(forKey:"formalPrompt") ?? APIClient.defaultFormalPrompt
+            let configuration = APIConfiguration(endpoint:endpoint,model:model,key:try SecretStore.read(endpoint),casualPrompt:casualPrompt,formalPrompt:formalPrompt)
             _ = try APIClient.makeRequest(text:source,configuration:configuration)
             let text = source; let token = generation
             busy = true
@@ -46,6 +51,7 @@ final class PolishModel: ObservableObject {
                     guard !Task.isCancelled, token == generation else { return }
                     result = response
                     selected = response.ambiguous ? nil : 0
+                    HistoryStore.shared.add(source:text,result:response)
                     busy = false
                 } catch {
                     guard !Task.isCancelled, token == generation else { return }
@@ -177,6 +183,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var status: NSStatusItem!
     var statusMessage: NSMenuItem!
     var overlay: FloatingPanel!
+    var candidates: FloatingPanel!
+    var candidateHosting: NSHostingView<CandidatePanelView>!
+    var candidateAnchor: CGRect?
+    var candidateOpensBelow = true
+    var candidateSizeObserver: AnyCancellable?
     var preview: NSWindow?
     var settings: NSWindow?
     var timer: Timer?
@@ -184,6 +195,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var paused = false
     var suspended = false
     var observers: [NSObjectProtocol] = []
+    var globalClickMonitor: Any?
+    var localClickMonitor: Any?
+
+    func makeCandidateView() -> CandidatePanelView {
+        CandidatePanelView(model:model,opensBelow:candidateOpensBelow,
+            choose:{ [weak self] index in
+                guard let self else { return }
+                self.model.selected = index
+                self.model.replace()
+                if self.model.completed { self.dismissCandidates() }
+            },togglePin:{ [weak self] in self?.toggleCandidatePin() },
+            close:{ [weak self] in self?.dismissCandidates() },
+            settings:{ [weak self] in self?.dismissCandidates();self?.showSettings() })
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -200,20 +225,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         menu.addItem(item("退出轻语",action:#selector(quit)))
         status.menu = menu
-        overlay = FloatingPanel(contentRect:NSRect(x:0,y:0,width:32,height:32),styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+        overlay = FloatingPanel(contentRect:NSRect(x:0,y:0,width:26,height:26),styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
         overlay.isOpaque = false; overlay.backgroundColor = .clear; overlay.hasShadow = true
         overlay.level = .floating; overlay.hidesOnDeactivate = false
         overlay.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary,.transient]
-        let button = NSButton(frame:NSRect(x:0,y:0,width:32,height:32))
-        button.title = "✨"; button.font = .systemFont(ofSize:18); button.bezelStyle = .circular
-        button.target = self; button.action = #selector(fromWhatsApp)
-        button.toolTip = "润色这段英文"; button.setAccessibilityLabel("润色 WhatsApp 草稿")
-        overlay.contentView = button
+        overlay.contentView = NSHostingView(rootView:PolishTrigger { [weak self] in self?.fromWhatsApp() })
+        candidateHosting = NSHostingView(rootView:makeCandidateView())
+        candidates = FloatingPanel(contentRect:NSRect(x:0,y:0,width:374,height:150),styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+        candidates.isOpaque = false; candidates.backgroundColor = .clear; candidates.hasShadow = false
+        candidates.level = .popUpMenu; candidates.hidesOnDeactivate = false
+        candidates.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary,.transient]
+        candidates.contentView = candidateHosting
+        candidateSizeObserver = model.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.resizeCandidates() }
+        }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDown]) { [weak self] _ in
+            Task { @MainActor in self?.closeUnpinnedCandidatesOutside() }
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDown]) { [weak self] event in
+            Task { @MainActor in self?.closeUnpinnedCandidatesOutside() }
+            return event
+        }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName:NSWorkspace.didActivateApplicationNotification,object:nil,queue:.main) { [weak self] notification in
             let appID = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
             Task { @MainActor in
-                guard let self, self.preview?.isVisible == true, self.model.attached else { return }
+                guard let self, self.preview?.isVisible == true, self.model.attached, !self.model.pinned else { return }
                 self.model.lease.observeActivation(isOwnApp:appID == Bundle.main.bundleIdentifier)
             }
         })
@@ -256,6 +293,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusMessage?.title = status.menuTitle
     }
     func tick() {
+        if candidates.isVisible {
+            if model.pinned { return }
+            let active = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            guard !paused, !suspended, desktopReady(),
+                  active == WhatsAppBridge.bundleID || active == Bundle.main.bundleIdentifier,
+                  let original = model.snapshot, let current = model.bridge.snapshot(requireFrontmost:false),
+                  original.identity.mayReplace(with:current.identity),
+                  CFEqual(original.element,current.element), CFEqual(original.header,current.header),
+                  original.bounds == current.bounds, original.composerBounds == current.composerBounds else {
+                dismissCandidates()
+                return
+            }
+            return
+        }
         guard !paused else { updateFloatingStatus(.paused); overlay.orderOut(nil); latest = nil; return }
         guard !suspended, desktopReady() else { updateFloatingStatus(.desktopUnavailable); overlay.orderOut(nil); latest = nil; return }
         guard preview?.isVisible != true || !model.lease.valid else { updateFloatingStatus(.previewOpen); overlay.orderOut(nil); latest = nil; return }
@@ -266,14 +317,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         let point = NSPoint(x:draft.bounds.midX,y:primaryHeight-draft.bounds.midY)
         guard let screen = NSScreen.screens.first(where:{$0.frame.contains(point)}) else { overlay.orderOut(nil); return }
-        overlay.setFrame(Placement.buttonRect(axRect:draft.bounds,primaryHeight:primaryHeight,visible:screen.visibleFrame),display:true)
+        overlay.setFrame(Placement.buttonRect(axRect:draft.bounds,composerRect:draft.composerBounds,primaryHeight:primaryHeight,visible:screen.visibleFrame),display:true)
         overlay.orderFrontRegardless()
     }
     @objc func fromWhatsApp() {
+        if candidates.isVisible { dismissCandidates(); return }
         guard desktopReady(), let draft = model.bridge.snapshot(), !draft.identity.text.isEmpty else { return }
-        model.prepare(draft); showPreview(); model.generate()
+        preview?.orderOut(nil)
+        model.prepare(draft)
+        model.generate()
+        candidateAnchor = overlay.frame
+        candidateOpensBelow = NSScreen.screens.first(where:{$0.frame.intersects(overlay.frame)})
+            .map { Placement.shouldOpenCandidatesBelow(anchor:overlay.frame,visible:$0.visibleFrame) } ?? true
+        candidateHosting.rootView = makeCandidateView()
+        resizeCandidates()
+        candidates.orderFrontRegardless()
     }
-    @objc func manual() { model.prepare(nil); showPreview() }
+    func toggleCandidatePin() {
+        model.pinned.toggle()
+    }
+    func resizeCandidates() {
+        guard let anchor=candidateAnchor,
+              let screen=NSScreen.screens.first(where:{$0.frame.intersects(anchor)}) else { return }
+        candidateHosting.layoutSubtreeIfNeeded()
+        let fitting=candidateHosting.fittingSize
+        let content=CGSize(width:max(374,fitting.width),height:max(82,fitting.height))
+        candidates.setFrame(Placement.candidateRect(anchor:anchor,contentSize:content,visible:screen.visibleFrame,opensBelow:candidateOpensBelow),display:true)
+    }
+    func closeUnpinnedCandidatesOutside() {
+        guard candidates.isVisible, !model.pinned else { return }
+        let point = NSEvent.mouseLocation
+        guard !candidates.frame.contains(point), !overlay.frame.contains(point) else { return }
+        dismissCandidates()
+    }
+    func dismissCandidates() {
+        guard candidates.isVisible || candidateAnchor != nil else { return }
+        candidates.orderOut(nil)
+        candidateAnchor=nil
+        model.cancel()
+        model.prepare(nil)
+        latest = nil
+    }
+    @objc func manual() { dismissCandidates(); model.prepare(nil); showPreview() }
     func showPreview() {
         overlay.orderOut(nil)
         if preview == nil {
@@ -287,9 +372,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func showSettings() {
         if settings == nil {
-            let window = NSWindow(contentRect:NSRect(x:0,y:0,width:562,height:670),styleMask:[.titled,.closable],backing:.buffered,defer:false)
+            let window = NSWindow(contentRect:NSRect(x:0,y:0,width:660,height:600),styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false)
             window.title = "轻语 · 设置"; window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView:SettingsView()); window.center(); settings = window
+            window.minSize = NSSize(width:620,height:520)
+            window.contentView = NSHostingView(rootView:SettingsView(history:HistoryStore.shared)); window.center(); settings = window
         }
         NSApp.activate(ignoringOtherApps:true); settings?.makeKeyAndOrderFront(nil)
     }
@@ -301,9 +387,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillClose(_ notification:Notification) {
         if let window = notification.object as? NSWindow, window === preview { model.cancel(); model.prepare(nil) }
     }
-    func applicationWillTerminate(_ notification:Notification) { timer?.invalidate(); model.cancel() }
+    func applicationWillTerminate(_ notification:Notification) {
+        timer?.invalidate(); model.cancel()
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+    }
 }
 
+#if !CANDIDATE_PREVIEW
 @main
 struct EnglishPolishApp {
     @MainActor static func main() {
@@ -313,3 +404,4 @@ struct EnglishPolishApp {
         withExtendedLifetime(delegate) { app.run() }
     }
 }
+#endif

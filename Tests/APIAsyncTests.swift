@@ -11,7 +11,7 @@ final class StubProtocol: URLProtocol {
     override func startLoading() {
         let job = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            let json = #"{"ambiguous":false,"question":"","options":[{"english":"I am here.","chinese":"我在这里。"}]}"#
+            let json = #"{"ambiguous":false,"question":"","options":[{"english":"I am here.","chinese":"我在这里。"},{"english":"I'm here.","chinese":"我在这里。"}]}"#
             let data = try! JSONSerialization.data(withJSONObject:["choices":[["finish_reason":"stop","message":["content":json]]]])
             self.client?.urlProtocol(self,didReceive:HTTPURLResponse(url:self.request.url!,statusCode:Self.status,httpVersion:nil,headerFields:nil)!,cacheStoragePolicy:.notAllowed)
             self.client?.urlProtocol(self,didLoad:data)
