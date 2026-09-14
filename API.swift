@@ -111,10 +111,9 @@ struct APIClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(configuration.key)", forHTTPHeaderField: "Authorization")
-        // ai-router v5.7 起跨模式切换必须显式声明。轻语是用户点按发起的润色请求，
-        // 所以允许 Router 在需要时切到 chat 模式；Router 仍会先停掉其他模型，
-        // 并按冷却与内存护栏拒绝切换（被拒时下面 parse() 会把原因显示出来）。
-        // 只对本地服务加这个头，外部 OpenAI 兼容 API 不需要。
+        // ai-router 默认负责模型切换：轻语是用户点按发起的请求，允许 Router
+        // 等待正在运行的请求完成，再切到 qwen-fast。这个兼容头不是必需条件；
+        // 只对本机服务发送，外部 OpenAI 兼容 API 不需要。
         if ["localhost", "127.0.0.1", "::1"].contains(base.host?.lowercased() ?? "") {
             request.setValue("1", forHTTPHeaderField: "X-Router-Auto-Switch")
         }
