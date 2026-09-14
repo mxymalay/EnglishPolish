@@ -111,6 +111,13 @@ struct APIClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(configuration.key)", forHTTPHeaderField: "Authorization")
+        // ai-router v5.7 起跨模式切换必须显式声明。轻语是用户点按发起的润色请求，
+        // 所以允许 Router 在需要时切到 chat 模式；Router 仍会先停掉其他模型，
+        // 并按冷却与内存护栏拒绝切换（被拒时下面 parse() 会把原因显示出来）。
+        // 只对本地服务加这个头，外部 OpenAI 兼容 API 不需要。
+        if ["localhost", "127.0.0.1", "::1"].contains(base.host?.lowercased() ?? "") {
+            request.setValue("1", forHTTPHeaderField: "X-Router-Auto-Switch")
+        }
         var payload: [String: Any] = [
             "model": configuration.model,
             "messages": [["role":"system", "content":system], ["role":"user", "content":text]],
@@ -145,11 +152,27 @@ struct APIClient {
         try endpointRequest(text:text, system:translateInstructions(target:target), configuration:configuration, jsonMode:true)
     }
 
+    /// ai-router v5.7：跨模式请求被拒时返回结构化的 503，把它的说明直接展示给用户，
+    /// 比「请检查服务地址和模型」这种泛化提示更能说清是哪种情况（目标模型没跑、
+    /// 刚切换过还在冷却、内存紧张）。
+    private static func routerUnavailableMessage(data: Data) -> String {
+        struct Envelope: Decodable {
+            struct ErrorBody: Decodable { let message: String?; let reason: String? }
+            let error: ErrorBody?
+        }
+        if let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+           let message = envelope.error?.message, !message.isEmpty {
+            return "AI 服务暂时不可用：\(message)"
+        }
+        return "AI 服务暂时不可用（HTTP 503）：本机可能正在运行其他模型，稍后重试即可。"
+    }
+
     static func parse(data: Data, status: Int, allowPlain: Bool = false) throws -> PolishResult {
         switch status {
         case 200..<300: break
         case 401,403: throw PolishError("密钥或模型权限不可用，请检查 AI 设置。")
         case 429: throw PolishError("AI 服务额度不足或请求过多，请检查账户后重试。")
+        case 503: throw PolishError(Self.routerUnavailableMessage(data: data))
         default: throw PolishError("AI 服务返回 HTTP \(status)，请检查服务地址和模型后重试。")
         }
         struct Envelope: Decodable {
