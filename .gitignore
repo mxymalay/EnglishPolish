@@ -1,0 +1,29 @@
+# 本地工作历史与生成物
+/work/
+/backups/
+build/
+*.app/
+*.zip
+*.log
+
+# 编译器与编辑器输出
+__pycache__/
+*.py[cod]
+*.swiftconstvalues
+*-sources.list
+*-const.list
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+xcuserdata/
+*.xcuserstate
+.DS_Store
+
+# 可重建的图标尺寸；保留源 PNG 与分发的 icns
+*.iconset/
+
+# 本地凭据/配置
+.env
+.env.*
+*.pem
+*.key
