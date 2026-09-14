@@ -5,14 +5,35 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import os
 
 ROOT = pathlib.Path(__file__).resolve().parent
 BUILD = ROOT / 'build'
 BUILD.mkdir(exist_ok=True)
 DESIGNATED_REQUIREMENT = '=designated => identifier "com.xy.english-polish"'
 
-def run(*args):
-    subprocess.run([str(arg) for arg in args], check=True)
+def run(*args, env=None):
+    subprocess.run([str(arg) for arg in args], check=True, env=env)
+
+def run_swift(*args, app=False):
+    # On this Mac the Xcode 26.6 driver and the Command Line Tools SDK can be
+    # installed at different Swift minor versions. Prefer the matching CLT
+    # toolchain when it is present; otherwise retain the caller's xcrun choice.
+    environment = os.environ.copy()
+    clt = pathlib.Path('/Library/Developer/CommandLineTools')
+    if (clt / 'usr/bin/swiftc').exists():
+        environment['DEVELOPER_DIR'] = str(clt)
+    swift_args = list(args)
+    if app:
+        # SwiftUI's macro implementation is shipped with the Xcode platform
+        # SDK, while the matching 6.4 compiler is in the CLT toolchain above.
+        # Point the compiler at both explicitly so a newer Xcode SDK cannot be
+        # paired with an older Xcode driver by xcrun.
+        sdk = pathlib.Path('/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk')
+        plugins = pathlib.Path('/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins')
+        if sdk.exists(): swift_args += ['-sdk', sdk]
+        if plugins.exists(): swift_args += ['-Xfrontend', '-plugin-path', '-Xfrontend', plugins]
+    run('xcrun', 'swiftc', *swift_args, env=environment)
 
 def build_icon(destination):
     iconset = BUILD / 'AppIcon.iconset'
@@ -29,13 +50,13 @@ def build_icon(destination):
 
 if '--test' in sys.argv:
     executable = BUILD / 'CoreTests'
-    run('xcrun', 'swiftc', '-swift-version', '5', ROOT/'Core.swift', ROOT/'History.swift', ROOT/'API.swift', ROOT/'Tests/main.swift', '-o', executable)
+    run_swift('-swift-version', '5', ROOT/'Core.swift', ROOT/'History.swift', ROOT/'API.swift', ROOT/'Tests/main.swift', '-o', executable)
     run(executable)
     async_executable = BUILD / 'APIAsyncTests'
-    run('xcrun', 'swiftc', '-swift-version', '5', '-parse-as-library', ROOT/'Core.swift', ROOT/'API.swift', ROOT/'Tests/APIAsyncTests.swift', '-o', async_executable)
+    run_swift('-swift-version', '5', '-parse-as-library', ROOT/'Core.swift', ROOT/'API.swift', ROOT/'Tests/APIAsyncTests.swift', '-o', async_executable)
     run(async_executable)
     history_executable = BUILD / 'HistoryTests'
-    run('xcrun','swiftc','-swift-version','5','-parse-as-library',ROOT/'Core.swift',ROOT/'History.swift',ROOT/'Tests/HistoryTests.swift','-o',history_executable)
+    run_swift('-swift-version','5','-parse-as-library',ROOT/'Core.swift',ROOT/'History.swift',ROOT/'Tests/HistoryTests.swift','-o',history_executable)
     run(history_executable)
 else:
     app = BUILD / '轻语.app'
@@ -53,15 +74,15 @@ else:
             'CFBundleExecutable': 'EnglishPolish',
             'CFBundlePackageType': 'APPL',
             'CFBundleIconFile': 'AppIcon.icns',
-            'CFBundleShortVersionString': '0.3.0',
-            'CFBundleVersion': '3',
+            'CFBundleShortVersionString': '0.3.1',
+            'CFBundleVersion': '4',
             'LSMinimumSystemVersion': '13.0',
             'LSUIElement': True,
             'NSHighResolutionCapable': True,
             'NSAccessibilityUsageDescription': '读取 WhatsApp 当前草稿并在你确认后替换润色结果。',
         }, f)
-    sources = [ROOT/name for name in ['Core.swift','History.swift','API.swift','WhatsAppBridge.swift','Settings.swift','CandidateView.swift','Main.swift']]
-    run('xcrun','swiftc','-swift-version','5','-O','-target','arm64-apple-macosx13.0','-parse-as-library',*sources,'-o',executable)
+    sources = [ROOT/name for name in ['Core.swift','History.swift','API.swift','WhatsAppBridge.swift','Settings.swift','CandidateView.swift','Translate.swift','TranslateView.swift','Main.swift']]
+    run_swift('-swift-version','5','-O','-target','arm64-apple-macosx13.0','-parse-as-library',*sources,'-o',executable,app=True)
     run('codesign','--force','--sign','-','--identifier','com.xy.english-polish',
         '--requirements',DESIGNATED_REQUIREMENT,app)
     run('codesign','--verify','--strict',app)

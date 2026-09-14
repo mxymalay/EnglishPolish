@@ -4,15 +4,29 @@ struct CandidateBubbleShape: Shape {
     let opensBelow: Bool
     func path(in rect: CGRect) -> Path {
         let arrowWidth: CGFloat = 18, arrowHeight: CGFloat = 9, radius: CGFloat = 13
-        let body = opensBelow
-            ? CGRect(x:0,y:arrowHeight,width:rect.width,height:max(0,rect.height-arrowHeight))
-            : CGRect(x:0,y:0,width:rect.width,height:max(0,rect.height-arrowHeight))
-        var path = Path(roundedRect:body,cornerRadius:radius)
-        let baseY = opensBelow ? arrowHeight + 1 : rect.height - arrowHeight - 1
-        let tipY = opensBelow ? 0 : rect.height
-        path.move(to:CGPoint(x:rect.midX-arrowWidth/2,y:baseY))
-        path.addLine(to:CGPoint(x:rect.midX,y:tipY))
-        path.addLine(to:CGPoint(x:rect.midX+arrowWidth/2,y:baseY))
+        let top = opensBelow ? arrowHeight : 0
+        let bottom = opensBelow ? rect.height : rect.height - arrowHeight
+        let tipY: CGFloat = opensBelow ? 0 : rect.height
+        var path = Path()
+        path.move(to:CGPoint(x:rect.minX,y:top + radius))
+        path.addArc(tangent1End:CGPoint(x:rect.minX,y:top),tangent2End:CGPoint(x:rect.minX + radius,y:top),radius:radius)
+        if opensBelow {
+            path.addLine(to:CGPoint(x:rect.midX - arrowWidth/2,y:top))
+            path.addLine(to:CGPoint(x:rect.midX,y:tipY))
+            path.addLine(to:CGPoint(x:rect.midX + arrowWidth/2,y:top))
+        }
+        path.addLine(to:CGPoint(x:rect.maxX - radius,y:top))
+        path.addArc(tangent1End:CGPoint(x:rect.maxX,y:top),tangent2End:CGPoint(x:rect.maxX,y:top + radius),radius:radius)
+        path.addLine(to:CGPoint(x:rect.maxX,y:bottom - radius))
+        path.addArc(tangent1End:CGPoint(x:rect.maxX,y:bottom),tangent2End:CGPoint(x:rect.maxX - radius,y:bottom),radius:radius)
+        if !opensBelow {
+            path.addLine(to:CGPoint(x:rect.midX + arrowWidth/2,y:bottom))
+            path.addLine(to:CGPoint(x:rect.midX,y:tipY))
+            path.addLine(to:CGPoint(x:rect.midX - arrowWidth/2,y:bottom))
+        }
+        path.addLine(to:CGPoint(x:rect.minX + radius,y:bottom))
+        path.addArc(tangent1End:CGPoint(x:rect.minX,y:bottom),tangent2End:CGPoint(x:rect.minX,y:bottom - radius),radius:radius)
+        path.addLine(to:CGPoint(x:rect.minX,y:top + radius))
         path.closeSubpath()
         return path
     }
@@ -42,11 +56,11 @@ struct PolishTrigger: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: "sparkles")
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: 14, weight: .medium))
+                .symbolRenderingMode(hovered ? .multicolor : .monochrome)
                 .foregroundStyle(hovered ? Color.accentColor : Color.secondary)
                 .frame(width: 26, height: 26)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.primary.opacity(0.09)))
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
@@ -82,6 +96,25 @@ struct CandidateRow: View {
     }
 }
 
+struct PinButton: View {
+    let pinned: Bool
+    let action: () -> Void
+    @State private var hovered = false
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: pinned ? "pin.fill" : "pin")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(pinned ? Color.accentColor : Color.secondary.opacity(hovered ? 1 : 0.7))
+                .frame(width: 20, height: 20)
+                .background(hovered || pinned ? Color.primary.opacity(0.07) : .clear, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help(pinned ? "取消固定" : "固定候选框")
+        .accessibilityLabel(pinned ? "取消固定候选框" : "固定候选框")
+    }
+}
+
 struct CandidateView: View {
     @ObservedObject var model: PolishModel
     var choose: (Int) -> Void
@@ -90,47 +123,25 @@ struct CandidateView: View {
     var settings: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Spacer()
-                Button(action: togglePin) {
-                    Image(systemName: model.pinned ? "pin.fill" : "pin")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(model.pinned ? Color.accentColor : Color.secondary)
-                        .frame(width: 24, height: 20)
-                }
-                .buttonStyle(.plain)
-                .help(model.pinned ? "取消固定" : "固定候选框")
-                .accessibilityLabel(model.pinned ? "取消固定候选框" : "固定候选框")
-            }
-            .frame(height: 23)
-            .padding(.horizontal, 4)
             if model.busy {
                 HStack(spacing: 9) {
                     ProgressView().controlSize(.small)
                     Text("正在润色…").font(.system(size: 12)).foregroundStyle(.secondary)
                     Spacer()
-                }.padding(.horizontal, 12).padding(.bottom, 12)
+                }
+                .padding(12)
+                .frame(minHeight: 58)
             } else if let result = model.result {
                 if result.ambiguous {
                     Text(result.question).font(.system(size: 11)).foregroundStyle(.secondary)
-                        .padding(.horizontal, 12).padding(.top, 10)
+                        .padding(.leading, 12).padding(.trailing, 24).padding(.top, 10)
                 }
-                ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(Array(result.options.enumerated()), id: \.offset) { index, option in
-                            if index > 0 { Divider().padding(.horizontal, 12) }
-                            CandidateRow(option: option, showMeaning: result.ambiguous) { choose(index) }
-                                .contextMenu {
-                                    Button("复制英文") { model.selected = index; model.copy() }
-                                }
-                        }
-                    }
-                }
-                .frame(height: contentHeight(result))
+                candidateList(result)
             }
             if !model.message.isEmpty {
                 Text(model.message).font(.system(size: 12)).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true).padding(12)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 12).padding(.trailing, 24).padding(.vertical, 12)
                 HStack {
                     Button("重试") { model.generate() }
                     Button("设置", action: settings)
@@ -141,14 +152,38 @@ struct CandidateView: View {
         }
         .padding(5)
         .frame(width: 350)
+        .overlay(alignment: .topTrailing) {
+            PinButton(pinned: model.pinned, action: togglePin).padding(6)
+        }
         .onExitCommand(perform: close)
     }
+    // Short results render as a plain list so the panel hugs the content exactly;
+    // the estimate is only used to decide whether the rare very-long draft needs
+    // a bounded scroll area (which is then always filled, so no blank space shows).
+    @ViewBuilder
+    private func candidateList(_ result: PolishResult) -> some View {
+        let rows = VStack(spacing: 0) {
+            ForEach(Array(result.options.enumerated()), id: \.offset) { index, option in
+                if index > 0 { Divider().padding(.horizontal, 12) }
+                CandidateRow(option: option, showMeaning: result.ambiguous) { choose(index) }
+                    .padding(.top, index == 0 ? 2 : 0)
+                    .padding(.trailing, index == 0 ? 16 : 0)
+                    .contextMenu {
+                        Button("复制英文") { model.selected = index; model.copy() }
+                    }
+            }
+        }
+        if contentHeight(result) >= 320 {
+            ScrollView { rows }.frame(height: 320)
+        } else {
+            rows
+        }
+    }
     private func contentHeight(_ result: PolishResult) -> CGFloat {
-        // Reserve space for wrapping while bounding long drafts to a scrollable dictionary-sized panel.
         let lines = result.options.reduce(0) { total, option in
             total + max(1, Int(ceil(Double(option.english.count) / 39)))
                 + (result.ambiguous ? max(1, Int(ceil(Double(option.chinese.count) / 23))) : 0)
         }
-        return min(320, max(96, CGFloat(lines) * 20 + 52))
+        return CGFloat(lines) * 20 + 52
     }
 }

@@ -41,6 +41,8 @@ struct GeneralSettingsPage:View {
     @ObservedObject var history:HistoryStore
     @State private var launchAtLogin=SMAppService.mainApp.status == .enabled
     @State private var loginMessage=""
+    @AppStorage("autoShowCandidates") private var autoShowCandidates=false
+    @AppStorage("hoverTranslateEnabled") private var hoverTranslateEnabled=true
     @AppStorage("historyEnabled") private var historyEnabled=true
     @AppStorage("historyLimit") private var historyLimit=50
     var body:some View {
@@ -48,6 +50,14 @@ struct GeneralSettingsPage:View {
             Section("启动") {
                 Toggle("登录 Mac 后自动启动轻语",isOn:$launchAtLogin).onChange(of:launchAtLogin){ updateLoginItem($0) }
                 if !loginMessage.isEmpty { Text(loginMessage).font(.caption).foregroundStyle(.secondary) }
+            }
+            Section("润色") {
+                Toggle("草稿停止输入约 2 秒后自动弹出候选",isOn:$autoShowCandidates)
+                Text("只读取 WhatsApp 当前输入框的草稿并在停止输入后自动生成两条英文候选，不自动发送。也可随时点击输入框旁的 ✨ 手动生成。").font(.caption).foregroundStyle(.secondary)
+            }
+            Section("翻译") {
+                Toggle("悬停消息时显示翻译按钮",isOn:$hoverTranslateEnabled)
+                Text("关闭后不再读取消息列表，悬停按钮与译文写入输入框的功能一并停用。").font(.caption).foregroundStyle(.secondary)
             }
             Section("历史") {
                 Toggle("保存润色历史",isOn:$historyEnabled)
