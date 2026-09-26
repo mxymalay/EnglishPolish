@@ -74,14 +74,14 @@ else:
             'CFBundleExecutable': 'EnglishPolish',
             'CFBundlePackageType': 'APPL',
             'CFBundleIconFile': 'AppIcon.icns',
-            'CFBundleShortVersionString': '0.3.1',
-            'CFBundleVersion': '4',
+            'CFBundleShortVersionString': '0.4.0',
+            'CFBundleVersion': '5',
             'LSMinimumSystemVersion': '13.0',
             'LSUIElement': True,
             'NSHighResolutionCapable': True,
             'NSAccessibilityUsageDescription': '读取 WhatsApp 当前草稿并在你确认后替换润色结果。',
         }, f)
-    sources = [ROOT/name for name in ['Core.swift','History.swift','API.swift','WhatsAppBridge.swift','Settings.swift','CandidateView.swift','Translate.swift','TranslateView.swift','Main.swift']]
+    sources = [ROOT/name for name in ['Core.swift','History.swift','API.swift','WhatsAppBridge.swift','Settings.swift','CandidateView.swift','ReasonView.swift','Translate.swift','TranslateView.swift','Main.swift']]
     run_swift('-swift-version','5','-O','-target','arm64-apple-macosx13.0','-parse-as-library',*sources,'-o',executable,app=True)
     run('codesign','--force','--sign','-','--identifier','com.xy.english-polish',
         '--requirements',DESIGNATED_REQUIREMENT,app)

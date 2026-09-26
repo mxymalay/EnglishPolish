@@ -32,6 +32,114 @@ final class NoRedirect: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }
 
+/// ai-router 的错误信封（见 DESIGN.md §4.5）：`error.reason` 是封闭集合，
+/// `error.message` 是一句可直接展示的中文说明。
+struct RouterEnvelope: Decodable {
+    struct Body: Decodable {
+        let type: String?
+        let reason: String?
+        let message: String?
+        let target: String?
+        let stage: String?
+        let retry_after: Double?
+        let eta_seconds: Double?
+    }
+    let error: Body?
+    let error_message: String?
+}
+
+/// 把「为什么这次不能用」变成一句能直接展示的中文。
+///
+/// ai-router 已经把这个判断做好了，轻语要做的是别把它丢掉：原来的泛化提示
+/// 「请检查服务地址和模型」看不出所以然，用户没法区分是模型没跑、被资源保护
+/// 挡住、内存不够，还是根本没连上。这里保留 Router 的原话，只在它没说的时候兜底。
+enum AIFailure {
+    /// 封闭集合的兜底翻译，仅在 Router 没有给出 message 时使用。
+    static func describe(_ reason: String) -> String {
+        switch reason {
+        case "model_not_running": return "目标模型没有在运行，当前策略也不允许自动拉起。"
+        case "model_busy": return "目标模型正忙，正在处理别的请求。"
+        case "exclusivity_conflict": return "目标模型和当前独占的模型冲突，需要一次切换。"
+        case "queue_full": return "等待队列已满，稍后再试。"
+        case "wait_timeout": return "等待模型释放超时。"
+        case "switch_timeout": return "切换模型超时。"
+        case "switch_failed": return "启动或停止模型进程失败。"
+        case "resource_pressure": return "内存护栏没有通过，当前空闲内存不足以拉起模型。"
+        case "resource_guard": return "资源保护已开启，本地模型被暂停自动拉起。"
+        case "external_not_configured": return "这个外部模型别名还没有配置。"
+        case "upstream_unreachable": return "上游服务连不上。"
+        case "upstream_timeout": return "上游服务超时。"
+        case "bad_request": return "请求体不是合法的 JSON。"
+        case "body_too_large": return "请求体超过了服务上限。"
+        case "not_found": return "服务地址的路径不存在。"
+        default: return "服务返回了 \(reason)。"
+        }
+    }
+
+    private static func retryHint(_ seconds: Double?) -> String {
+        guard let seconds, seconds > 0 else { return "" }
+        return "（约 \(Int(seconds.rounded())) 秒后可重试）"
+    }
+
+    /// HTTP 非 2xx 的中文原因。503 走 Router 的结构化说明，其他状态码保持原来的文案。
+    static func httpReason(data: Data, status: Int) -> String {
+        switch status {
+        case 401, 403: return "密钥或模型权限不可用，请检查 AI 设置。"
+        case 429: return "AI 服务额度不足或请求过多，请检查账户后重试。"
+        default: break
+        }
+        let envelope = try? JSONDecoder().decode(RouterEnvelope.self, from: data)
+        let body = envelope?.error
+        let stated = [body?.message, envelope?.error_message]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let stated {
+            return "AI 服务暂时不可用：\(stated)\(retryHint(body?.retry_after))"
+        }
+        if let reason = body?.reason, !reason.isEmpty {
+            return "AI 服务暂时不可用：\(describe(reason))\(retryHint(body?.retry_after))"
+        }
+        if status == 503 {
+            return "AI 服务暂时不可用（HTTP 503）：本机可能正在运行其他模型，稍后重试即可。"
+        }
+        return "AI 服务返回 HTTP \(status)，请检查服务地址和模型后重试。"
+    }
+
+    static func hostLabel(_ url: URL?) -> String {
+        guard let url, let host = url.host else { return "AI 服务" }
+        return url.port.map { "\(host):\($0)" } ?? host
+    }
+
+    static func isLocal(_ url: URL?) -> Bool {
+        ["localhost", "127.0.0.1", "::1"].contains(url?.host?.lowercased() ?? "")
+    }
+
+    /// 请求根本没发出去时的中文原因。原来的 `error.localizedDescription` 是系统
+    /// 英文文案（"Could not connect to the server."），既看不懂也没说清该做什么。
+    static func transportReason(_ error: URLError, endpoint: URL?) -> String {
+        let host = hostLabel(endpoint)
+        switch error.code {
+        case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
+            return isLocal(endpoint)
+                ? "连不上本机 AI 服务（\(host)）。ai-router 可能没有在运行，请先启动它再重试。"
+                : "连不上 AI 服务（\(host)）。请检查服务地址和网络后重试。"
+        case .timedOut:
+            return "请求超时（\(host)）。本地模型可能正在加载或切换，稍等一会儿再重试。"
+        case .networkConnectionLost:
+            return "与 AI 服务（\(host)）的连接中断了，请重试。"
+        case .notConnectedToInternet:
+            return "这台 Mac 现在没有网络连接。"
+        case .secureConnectionFailed, .serverCertificateUntrusted,
+             .serverCertificateHasBadDate, .serverCertificateNotYetValid:
+            return "无法与 \(host) 建立安全连接，请检查服务地址。"
+        case .appTransportSecurityRequiresSecureConnection:
+            return "系统拒绝了这个地址（ATS）：只有本机代理可以用 http，其他地址必须是 https。"
+        default:
+            return "无法访问 AI 服务（\(host)）：\(error.localizedDescription)"
+        }
+    }
+}
+
 struct APIClient {
     var session: URLSession? = nil
     static let defaultCasualPrompt = """
@@ -151,29 +259,30 @@ struct APIClient {
         try endpointRequest(text:text, system:translateInstructions(target:target), configuration:configuration, jsonMode:true)
     }
 
-    /// ai-router v5.7：跨模式请求被拒时返回结构化的 503，把它的说明直接展示给用户，
-    /// 比「请检查服务地址和模型」这种泛化提示更能说清是哪种情况（目标模型没跑、
-    /// 刚切换过还在冷却、内存紧张）。
-    private static func routerUnavailableMessage(data: Data) -> String {
-        struct Envelope: Decodable {
-            struct ErrorBody: Decodable { let message: String?; let reason: String? }
-            let error: ErrorBody?
+    /// 一次请求的收发。网络层错误在这里就翻译成中文原因，不要漏到 UI 上去显示
+    /// 系统英文文案；取消仍然按取消处理，否则「取消」会被当成失败弹提示。
+    private static func send(_ session: URLSession, _ request: URLRequest) async throws -> (Data, Int) {
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard data.count <= 1_000_000, let response = response as? HTTPURLResponse else {
+                throw PolishError("AI 返回内容异常，请重试。")
+            }
+            return (data, response.statusCode)
+        } catch let error as PolishError {
+            throw error
+        } catch let error as URLError {
+            if error.code == .cancelled {
+                // 只有真的被取消才当取消处理：把别的 cancelled 也吞掉，会留下一个
+                // 永远转圈、再也不复位的状态。
+                if Task.isCancelled { throw CancellationError() }
+                throw PolishError("这次请求被中断了，请重试。")
+            }
+            throw PolishError(AIFailure.transportReason(error, endpoint: request.url))
         }
-        if let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-           let message = envelope.error?.message, !message.isEmpty {
-            return "AI 服务暂时不可用：\(message)"
-        }
-        return "AI 服务暂时不可用（HTTP 503）：本机可能正在运行其他模型，稍后重试即可。"
     }
 
     static func parse(data: Data, status: Int, allowPlain: Bool = false) throws -> PolishResult {
-        switch status {
-        case 200..<300: break
-        case 401,403: throw PolishError("密钥或模型权限不可用，请检查 AI 设置。")
-        case 429: throw PolishError("AI 服务额度不足或请求过多，请检查账户后重试。")
-        case 503: throw PolishError(Self.routerUnavailableMessage(data: data))
-        default: throw PolishError("AI 服务返回 HTTP \(status)，请检查服务地址和模型后重试。")
-        }
+        guard (200..<300).contains(status) else { throw PolishError(AIFailure.httpReason(data: data, status: status)) }
         struct Envelope: Decodable {
             struct Choice: Decodable {
                 struct Message: Decodable { let content: String? }
@@ -198,12 +307,7 @@ struct APIClient {
     }
 
     static func parseTranslation(data: Data, status: Int) throws -> String {
-        switch status {
-        case 200..<300: break
-        case 401,403: throw PolishError("密钥或模型权限不可用，请检查 AI 设置。")
-        case 429: throw PolishError("AI 服务额度不足或请求过多，请检查账户后重试。")
-        default: throw PolishError("AI 服务返回 HTTP \(status)，请检查服务地址和模型后重试。")
-        }
+        guard (200..<300).contains(status) else { throw PolishError(AIFailure.httpReason(data: data, status: status)) }
         struct Envelope: Decodable {
             struct Choice: Decodable {
                 struct Message: Decodable { let content: String? }
@@ -268,10 +372,9 @@ struct APIClient {
         defer { if session == nil { activeSession.invalidateAndCancel() } }
         func send(compact: Bool) async throws -> PolishResult {
             let request = try Self.makeRequest(text:text, configuration:configuration, compact:compact)
-            let (data, response) = try await activeSession.data(for: request)
+            let (data, status) = try await Self.send(activeSession, request)
             try Task.checkCancellation()
-            guard data.count <= 1_000_000, let response = response as? HTTPURLResponse else { throw PolishError("AI 返回内容异常，请重试。") }
-            return try Self.parse(data:data, status:response.statusCode,allowPlain:compact)
+            return try Self.parse(data:data, status:status, allowPlain:compact)
         }
         do {
             return try await send(compact:false)
@@ -289,9 +392,8 @@ struct APIClient {
         let activeSession = session ?? URLSession(configuration:config, delegate:NoRedirect(), delegateQueue:nil)
         defer { if session == nil { activeSession.invalidateAndCancel() } }
         let request = try Self.makeTranslateRequest(text:text, target:target, configuration:configuration)
-        let (data, response) = try await activeSession.data(for: request)
+        let (data, status) = try await Self.send(activeSession, request)
         try Task.checkCancellation()
-        guard data.count <= 1_000_000, let response = response as? HTTPURLResponse else { throw PolishError("AI 返回内容异常，请重试。") }
-        return try Self.parseTranslation(data:data, status:response.statusCode)
+        return try Self.parseTranslation(data:data, status:status)
     }
 }

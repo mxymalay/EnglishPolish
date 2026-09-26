@@ -15,6 +15,8 @@ final class TranslateModel: ObservableObject {
     @Published private(set) var target: MessageBubble?
     @Published private(set) var phase: TranslationPhase = .idle
     @Published private(set) var waitingStatus: String?
+    /// 失败时记住是哪条消息，让原因气泡上的「重试」有东西可重试。
+    private(set) var failedBubble: MessageBubble?
     private var cache: [String: String] = [:]
     private var task: Task<Void,Never>?
     private var statusTask: Task<Void,Never>?
@@ -63,6 +65,7 @@ final class TranslateModel: ObservableObject {
         let key = bubble.text
         target = bubble
         if let cached = cache[key] {
+            failedBubble = nil
             phase = .done(cached)
             return
         }
@@ -76,23 +79,34 @@ final class TranslateModel: ObservableObject {
                 let translation = try await APIClient().translate(key,target:APIClient.incomingTarget,configuration:configuration)
                 guard let self, !Task.isCancelled, self.target?.text == key else { return }
                 self.cache[key] = translation
+                self.failedBubble = nil
                 self.phase = .done(translation)
                 self.stopStatusPolling()
             } catch is CancellationError {
             } catch {
                 guard let self, !Task.isCancelled, self.target?.text == key else { return }
                 self.phase = .failed(error.localizedDescription)
-                // A failed attempt must never wedge the hover button.
-                self.target = nil
+                // 失败必须留下痕迹：记住这条消息，并让 AppDelegate 弹原因气泡。
+                // target 留着不会卡住悬停按钮——按钮只在 phase == .busy 时转圈。
+                self.failedBubble = self.target
                 self.stopStatusPolling()
             }
         }
+    }
+
+    /// 原因气泡上的「重试」：清掉失败态，对同一条消息重新发一次。
+    func retry() {
+        guard let bubble = failedBubble else { return }
+        failedBubble = nil
+        phase = .idle
+        show(bubble)
     }
 
     func dismiss() {
         task?.cancel(); task = nil
         stopStatusPolling()
         target = nil
+        failedBubble = nil
         phase = .idle
     }
 

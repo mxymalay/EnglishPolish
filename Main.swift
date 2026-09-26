@@ -218,9 +218,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var candidateAnchor: CGRect?
     var candidateOpensBelow = true
     var candidateSizeObserver: AnyCancellable?
-    var statusFlash: (text: String, until: Date)?
     let translator = TranslateModel()
     var translateObserver: AnyCancellable?
+    let reason = ReasonModel()
+    var reasonPanel: FloatingPanel?
+    var reasonHosting: NSHostingView<ReasonPanelView>?
+    var reasonAnchor: CGRect?
+    var reasonOpensBelow = false
+    var reasonRetry: (() -> Void)?
+    /// 同一个失败原因只处理一次。phase 会一直是 .failed，而 objectWillChange
+    /// 还会再触发几次，不加这个标记就会反复往输入框里写同一段文字。
+    var displayedFailure: String?
+    var escapeMonitor: Any?
+    var reasonHideWork: DispatchWorkItem?
     var hoverButtonPanel: FloatingPanel?
     var hoverHosting: NSHostingView<HoverTranslateButton>?
     var keyEventTap: CFMachPort?
@@ -320,6 +330,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return event
         }
+        // Esc 是"关不掉"的兜底出口。两个浮层都收掉，不管当前是哪个、有没有被固定。
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching:[.keyDown]) { [weak self] event in
+            guard event.keyCode == 53 else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                if self.reason.isShowing { self.hideReason() }
+                if self.candidates.isVisible { self.dismissCandidates() }
+            }
+        }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName:NSWorkspace.didActivateApplicationNotification,object:nil,queue:.main) { [weak self] notification in
             let appID = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
@@ -375,12 +394,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let item = NSMenuItem(title:title,action:action,keyEquivalent:""); item.target = self; return item
     }
     func updateFloatingStatus(_ status: FloatingButtonStatus) {
-        if let flash = statusFlash, flash.until > Date() { statusMessage?.title = flash.text; return }
-        statusFlash = nil
         statusMessage?.title = status.menuTitle
     }
     func tick() {
         refreshVisibleBubbles()
+        // 原因气泡跟着 WhatsApp 走：离开 WhatsApp、暂停、锁屏都收起来，避免它挂在
+        // 桌面上没人管。
+        if reasonPanel?.isVisible == true {
+            let active = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            if paused || suspended || !desktopReady()
+                || (active != WhatsAppBridge.bundleID && active != Bundle.main.bundleIdentifier) {
+                hideReason()
+            }
+        }
         if candidates.isVisible {
             if model.pinned { return }
             let active = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
@@ -414,7 +440,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func fromWhatsApp() {
         if candidates.isVisible { dismissCandidates(); return }
-        guard desktopReady(), let draft = model.bridge.snapshot(), !draft.identity.text.isEmpty else { return }
+        hideReason()
+        guard desktopReady() else {
+            showReason(AIReason(title:"桌面暂不可用",message:"屏幕处于锁定或休眠状态，恢复后再点 ✨。",retryable:false))
+            return
+        }
+        guard let draft = model.bridge.snapshot(), !draft.identity.text.isEmpty else {
+            // 点了 ✨ 却读不到草稿时也要说一声，不能什么都不显示。
+            showReason(AIReason(title:"没读到草稿",message:"读不到 WhatsApp 输入框里的内容。请先点一下输入框、写下英文，再点 ✨。",hint:"浮动按钮只跟随当前聊天的输入框。",retryable:false))
+            return
+        }
         preview?.orderOut(nil)
         model.prepare(draft)
         model.generate()
@@ -464,9 +499,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         candidates.setFrame(frame,display:true)
     }
-    func flashStatus(_ text: String) {
-        statusFlash = (text,Date().addingTimeInterval(4))
-        statusMessage?.title = text
+    // MARK: - 原因气泡
+
+    // 任何一次 AI 失败都要落到一个看得见的气泡上：锚在 WhatsApp 输入框旁，和候选
+    // 气泡同一套外观。只写菜单栏等于没写——用户在看 WhatsApp，菜单栏标题要展开
+    // 才看得到，结果就是「点了没反应」。
+    func makeReasonView() -> ReasonPanelView {
+        ReasonPanelView(model:reason,opensBelow:reasonOpensBelow,
+            retry:{ [weak self] in self?.retryReason() },
+            settings:{ [weak self] in self?.hideReason();self?.showSettings() },
+            close:{ [weak self] in self?.hideReason() })
+    }
+
+    func makeReasonPanel() -> FloatingPanel {
+        let panel = FloatingPanel(contentRect:NSRect(x:0,y:0,width:354,height:150),styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
+        panel.level = .popUpMenu; panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary,.transient]
+        reasonHosting = NSHostingView(rootView:makeReasonView())
+        panel.contentView = reasonHosting
+        return panel
+    }
+
+    // 浮层的显示/隐藏各记一行，出问题时有据可查。没有日志就只能靠猜。
+    func logPanel(_ event: String) {
+        let url = URL(fileURLWithPath:"/tmp/lightu-panels.log")
+        let line = "\(ISO8601DateFormatter().string(from:Date())) \(event)\n"
+        if let handle = try? FileHandle(forWritingTo:url) {
+            handle.seekToEndOfFile(); handle.write(Data(line.utf8)); try? handle.close()
+        } else {
+            try? line.write(to:url,atomically:true,encoding:.utf8)
+        }
+    }
+
+    func showReason(_ reason: AIReason, retry: (() -> Void)? = nil) {
+        // 原因气泡和候选气泡都挂在输入框上方。同时出现会互相压住，也分不清点的是哪个，
+        // 表现成"关不掉"。所以显示一个就把另一个收掉。
+        if candidates.isVisible { dismissCandidates() }
+        self.reason.show(reason)
+        reasonRetry = retry
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let composer = model.bridge.snapshot(requireFrontmost:false,allowEmpty:true)?.composerBounds ?? latest?.composerBounds
+        reasonAnchor = composer.map { appKitRect($0,primaryHeight:primaryHeight) }
+            ?? CGRect(origin:NSEvent.mouseLocation,size:.zero)
+        reasonOpensBelow = false
+        if reasonPanel == nil { reasonPanel = makeReasonPanel() }
+        reasonHosting?.rootView = makeReasonView()
+        reasonHosting?.layoutSubtreeIfNeeded()
+        reasonPanel?.setFrame(reasonFrame(),display:true)
+        reasonPanel?.orderFrontRegardless()
+        logPanel("show reason: \(reason.title) | anchor=\(reasonAnchor ?? .zero) | frame=\(reasonPanel?.frame ?? .zero)")
+        // 兜底：这个气泡不能变成关不掉的障碍物。到时自动收掉，原因在别处也还看得到。
+        reasonHideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.reason.isShowing else { return }
+            self.logPanel("auto-hide reason after timeout")
+            self.hideReason()
+        }
+        reasonHideWork = work
+        DispatchQueue.main.asyncAfter(deadline:.now()+25,execute:work)
+    }
+
+    func reasonFrame() -> CGRect {
+        let anchor = reasonAnchor ?? CGRect(origin:NSEvent.mouseLocation,size:.zero)
+        let visible = NSScreen.screens.first(where:{$0.frame.intersects(anchor)})?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? CGRect(x:0,y:0,width:1200,height:800)
+        let fitting = reasonHosting?.fittingSize ?? CGSize(width:354,height:150)
+        let content = CGSize(width:max(354,fitting.width),height:max(64,fitting.height))
+        let spaceBelow = anchor.minY - visible.minY - 8
+        let spaceAbove = visible.maxY - anchor.maxY - 8
+        // 默认往上展开，别盖住用户正在看的输入框；上面放不下再翻到下面。
+        let below = reasonOpensBelow
+            ? !(content.height > spaceBelow && spaceAbove >= content.height)
+            : (content.height > spaceAbove && spaceBelow >= content.height)
+        if below != reasonOpensBelow {
+            reasonOpensBelow = below
+            reasonHosting?.rootView = makeReasonView()
+            reasonHosting?.layoutSubtreeIfNeeded()
+        }
+        let size = CGSize(width:max(354,reasonHosting?.fittingSize.width ?? 0),height:max(64,reasonHosting?.fittingSize.height ?? 0))
+        return Placement.candidateRect(anchor:anchor,contentSize:size,visible:visible,opensBelow:reasonOpensBelow)
+    }
+
+    func hideReason() {
+        reasonHideWork?.cancel(); reasonHideWork = nil
+        if reasonPanel?.isVisible == true { logPanel("hide reason") }
+        reasonPanel?.orderOut(nil)
+        reasonAnchor = nil
+        reasonRetry = nil
+        reason.clear()
+    }
+
+    func retryReason() {
+        let action = reasonRetry
+        hideReason()
+        action?()
     }
 
     // Optional auto mode: once the draft stops changing, open the candidate panel
@@ -483,6 +611,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func closeUnpinnedCandidatesOutside() {
+        if reasonPanel?.isVisible == true, let frame = reasonPanel?.frame, !frame.contains(NSEvent.mouseLocation) {
+            hideReason()
+        }
         guard candidates.isVisible, !model.pinned else { return }
         let point = NSEvent.mouseLocation
         guard !candidates.frame.contains(point), !overlay.frame.contains(point) else { return }
@@ -646,6 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func translateHovered() {
         guard let bubble = hoveredBubble else { return }
+        hideReason()
         translationAnchorFrame = hoverButtonPanel?.frame
         // Re-scan so the bubble anchors to the message's current position even if the
         // list scrolled since the last periodic scan.
@@ -658,37 +790,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // replaced so any interaction afterwards restores it.
     func presentTranslationInComposer() {
         if case .failed(let error) = translator.phase {
-            flashStatus("翻译失败：\(error)")
-            translator.dismiss()
+            guard displayedFailure != error else { return }
+            displayedFailure = error
+            // 原因跟译文走同一条路写进输入框。写进去了就不再弹气泡——输入框里已经
+            // 有，再弹一个就是同一件事说两遍。只有写不进去才退回气泡，否则真的一声
+            // 不吭。不调 translator.dismiss()：failedBubble 要留着给重试用。
+            if displayInComposer("【翻译失败】\(error)") {
+                hideReason()
+            } else {
+                showReason(AIReason(title:"翻译失败",message:error,
+                                    hint:"读不到 WhatsApp 的输入框，只能在这里显示原因。"),
+                           retry:{ [weak self] in self?.translator.retry() })
+            }
+            hideHoverButton()
             return
         }
+        // 回到非失败态就清掉标记，下一次失败能重新提示。
+        displayedFailure = nil
         guard let translation = translator.doneText, translator.target != nil else { return }
-        if translationDisplayState.snapshot == nil {
-            // The composer may be empty; the original (possibly "") is what gets restored.
-            guard let snap = model.bridge.snapshot(requireFrontmost:false,allowEmpty:true) else { return }
-            translationDisplayState.snapshot = snap
-            translationDisplayState.original = snap.identity.text
-        }
-        let ok = model.bridge.write(translationDisplayState.snapshot!,text:translation)
-        if !ok {
-            translationDisplayState.snapshot = nil
-            translationDisplayState.original = ""
-            translationDisplayState.composerBounds = nil
+        if displayInComposer(translation) {
+            hideReason()
         } else {
-            translationDisplayState.composerBounds = nil
-            translationOpenedAt = Date()
-            // The composer grows once the translation lands; re-measure it shortly
-            // after so hit-testing matches the grown field.
-            for delay in [0.5, 1.5] {
-                DispatchQueue.main.asyncAfter(deadline:.now()+delay) { [weak self] in
-                    guard let self, translationDisplayState.snapshot != nil else { return }
-                    translationDisplayState.composerBounds = self.model.bridge.snapshot(requireFrontmost:false,allowEmpty:true)?.composerBounds
-                }
-            }
+            // 写不进去同样要说清楚，并把译文留在剪贴板，别让用户白等一次。
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(translation,forType:.string)
+            showReason(AIReason(title:"没能写进输入框",message:"读不到或写不进 WhatsApp 的输入框，请先点一下聊天输入框再重试。",hint:"译文已复制到剪贴板，可以直接粘贴。",retryable:false))
         }
         // Delivered: clear the target so the hover button can appear again.
         translator.dismiss()
         hideHoverButton()
+    }
+
+    /// 把一段文字临时写进 WhatsApp 输入框。译文和失败原因共用这一条路，行为完全一致：
+    /// 记住被替换掉的草稿，指针离开输入框、超过 12 秒、或按下任意键都会还原，
+    /// 回车被事件拦截吞掉，不会被误发出去。返回是否真的写成功。
+    @discardableResult
+    func displayInComposer(_ text: String) -> Bool {
+        if translationDisplayState.snapshot == nil {
+            // The composer may be empty; the original (possibly "") is what gets restored.
+            guard let snap = model.bridge.snapshot(requireFrontmost:false,allowEmpty:true) else { return false }
+            translationDisplayState.snapshot = snap
+            translationDisplayState.original = snap.identity.text
+        }
+        guard model.bridge.write(translationDisplayState.snapshot!,text:text) else {
+            translationDisplayState.snapshot = nil
+            translationDisplayState.original = ""
+            translationDisplayState.composerBounds = nil
+            return false
+        }
+        translationDisplayState.composerBounds = nil
+        translationOpenedAt = Date()
+        // The composer grows once the text lands; re-measure it shortly after so
+        // hit-testing matches the grown field.
+        for delay in [0.5, 1.5] {
+            DispatchQueue.main.asyncAfter(deadline:.now()+delay) { [weak self] in
+                guard let self, translationDisplayState.snapshot != nil else { return }
+                translationDisplayState.composerBounds = self.model.bridge.snapshot(requireFrontmost:false,allowEmpty:true)?.composerBounds
+            }
+        }
+        return true
     }
 
     // True while the pointer hovers the composer showing a translation. `generous`
@@ -732,6 +892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         func dismissCandidates() {
         guard candidates.isVisible || candidateAnchor != nil else { return }
+        if candidates.isVisible { logPanel("dismiss candidates") }
         candidates.orderOut(nil)
         candidateAnchor=nil
         if let dismissed = model.snapshot?.identity.text { autoCandidateToken = dismissed }
@@ -773,6 +934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let moveMonitor { NSEvent.removeMonitor(moveMonitor) }
         if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
         if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+        if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
     }
 }
 
