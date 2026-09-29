@@ -195,8 +195,11 @@ final class WhatsAppBridge {
     // WhatsApp renders its share/emoji controls in a hover layer that is not a
     // descendant of the message cell. Hit-test the system AX element at a small
     // grid beside the cell to read those real button frames and use their shared
-    // vertical center as our anchor.
-    func hoverActionAnchor(near cellRect: CGRect) -> CGRect? {
+    // vertical center as our anchor. `excluding` lists frames (both coordinate
+    // conventions) that the grid must skip — our own panels occupy that same
+    // region, and a hit-test landing on them gets routed back into this process
+    // and requires the main thread to service.
+    func hoverActionAnchor(near cellRect: CGRect, excluding excludedFrames: [CGRect] = []) -> CGRect? {
         guard AXIsProcessTrusted(),
               let app = NSRunningApplication.runningApplications(withBundleIdentifier:Self.bundleID).first,
               !app.isTerminated else { return nil }
@@ -232,6 +235,7 @@ final class WhatsAppBridge {
         }
 
         let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system,0.5)
         var frames: [CGRect] = []
         let xStart = max(0, cellRect.maxX - 6)
         let xEnd = cellRect.maxX + 180
@@ -240,6 +244,8 @@ final class WhatsAppBridge {
         let screenHeight = NSScreen.screens.first?.frame.height ?? 0
 
         func probe(_ x: CGFloat, _ pointY: CGFloat) {
+            let point = CGPoint(x:x,y:pointY)
+            if excludedFrames.contains(where:{ $0.contains(point) }) { return }
             var hit: AXUIElement?
             guard AXUIElementCopyElementAtPosition(system, Float(x), Float(pointY), &hit) == .success,
                   let hit,

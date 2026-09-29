@@ -12,6 +12,48 @@ struct Suggestion: Codable, Equatable {
     let chinese: String
 }
 
+// 一条保存过的 AI 连接（历史连接）。密钥不在这里——它按地址存钥匙串。
+struct AIProfile: Codable, Equatable, Identifiable {
+    var endpoint: String
+    var name: String
+    var model: String
+    var id: String { endpoint }
+}
+
+enum AIProfileStore {
+    static let storageKey = "aiProfiles"
+
+    static func load(_ defaults: UserDefaults = .standard) -> [AIProfile] {
+        guard let data = defaults.data(forKey:storageKey),
+              let profiles = try? JSONDecoder().decode([AIProfile].self,from:data) else { return [] }
+        return profiles
+    }
+
+    static func save(_ profiles: [AIProfile], defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(profiles) else { return }
+        defaults.set(data,forKey:storageKey)
+    }
+
+    // 同一地址只保留一条：换个名字或模型就是更新；新配置排最前，列表即使用历史。
+    static func upsert(_ profile: AIProfile, into profiles: [AIProfile]) -> [AIProfile] {
+        var result = profiles.filter { $0.endpoint != profile.endpoint }
+        result.insert(profile,at:0)
+        return result
+    }
+
+    static func remove(endpoint: String, from profiles: [AIProfile]) -> [AIProfile] {
+        profiles.filter { $0.endpoint != endpoint }
+    }
+
+    // 没起名字的配置用 host[:port] 显示，让历史列表每行都能认出来。
+    static func displayName(endpoint: String, name: String) -> String {
+        let trimmed = name.trimmingCharacters(in:.whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        guard let url = URL(string:endpoint), let host = url.host else { return endpoint }
+        return url.port.map { "\(host):\($0)" } ?? host
+    }
+}
+
 struct PolishResult: Codable {
     let ambiguous: Bool
     let question: String

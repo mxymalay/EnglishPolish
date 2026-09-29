@@ -243,6 +243,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var hoverButtonEnabled: Bool?
     var hoverAnchorGeneration = 0
     var hoverAnchorRequestInFlight = false
+    // 主线程绝不发同步 AX 调用：后台线程服务 hit-test 时握着 HIServices 的锁、
+    // 又要主线程来跑视图树更新；主线程一旦也陷进 AX 客户端调用等同一把锁，
+    // 两条线程就互相等死（整个 app 连菜单栏都点不动）。周期性的读取全部
+    // 走这条串行队列，主线程只收结果。
+    private let axQueue = DispatchQueue(label:"com.xy.english-polish.ax",qos:.userInitiated)
+    private var axReadInFlight = false
+    private var scanInFlight = false
+    private var scanGeneration = 0
     var translationAnchorFrame: CGRect?
     var translationOpenedAt: Date?
     var hoverTimer: Timer?
@@ -288,6 +296,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(item("设置…",action:#selector(showSettings)))
         menu.addItem(item("暂停浮动按钮",action:#selector(togglePause)))
         menu.addItem(.separator())
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+            menu.addItem(item("轻语 v\(version)",action:nil))
+        }
         menu.addItem(item("退出轻语",action:#selector(quit)))
         status.menu = menu
         overlay = FloatingPanel(contentRect:NSRect(x:0,y:0,width:26,height:26),styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
@@ -411,14 +422,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if model.pinned { return }
             let active = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
             guard !paused, !suspended, desktopReady(),
-                  active == WhatsAppBridge.bundleID || active == Bundle.main.bundleIdentifier,
-                  let original = model.snapshot, let current = model.bridge.snapshot(requireFrontmost:false),
-                  original.identity.mayReplace(with:current.identity),
-                  CFEqual(original.element,current.element), CFEqual(original.header,current.header),
-                  original.bounds == current.bounds, original.composerBounds == current.composerBounds else {
+                  active == WhatsAppBridge.bundleID || active == Bundle.main.bundleIdentifier else {
                 dismissCandidates()
                 return
             }
+            requestCandidatesRecheck()
             return
         }
         guard !paused else { updateFloatingStatus(.paused); overlay.orderOut(nil); latest = nil; return }
@@ -427,7 +435,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // The composer currently shows a message translation; keep the polish flows
         // out of the way until the original draft is restored.
         guard translationDisplayState.snapshot == nil else { overlay.orderOut(nil); latest = nil; return }
-        let probe = model.bridge.probe()
+        requestComposerProbe()
+    }
+
+    // 草稿身份校验的 AX 读取放在后台队列；读完后回主线程比对，读不到或
+    // 身份对不上就收起候选面板。
+    private func requestCandidatesRecheck() {
+        guard !axReadInFlight else { return }
+        axReadInFlight = true
+        let bridge = model.bridge
+        axQueue.async { [weak self] in
+            let current = bridge.snapshot(requireFrontmost:false)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.axReadInFlight = false
+                guard self.candidates.isVisible, !self.model.pinned else { return }
+                guard let original = self.model.snapshot, let current,
+                      original.identity.mayReplace(with:current.identity),
+                      CFEqual(original.element,current.element), CFEqual(original.header,current.header),
+                      original.bounds == current.bounds, original.composerBounds == current.composerBounds else {
+                    self.dismissCandidates()
+                    return
+                }
+            }
+        }
+    }
+
+    private func requestComposerProbe() {
+        guard !axReadInFlight else { return }
+        axReadInFlight = true
+        let bridge = model.bridge
+        axQueue.async { [weak self] in
+            let probe = bridge.probe()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.axReadInFlight = false
+                self.applyComposerProbe(probe)
+            }
+        }
+    }
+
+    // probe 的结果回到主线程后才应用；读取期间暂停/预览/译文显示随时可能
+    // 开始，所以守卫在这里全部重查一遍，不成立就等下一个 tick 处理。
+    private func applyComposerProbe(_ probe: DraftProbe) {
+        guard !paused, !suspended, desktopReady(),
+              preview?.isVisible != true || !model.lease.valid,
+              translationDisplayState.snapshot == nil,
+              !candidates.isVisible else { return }
         updateFloatingStatus(probe.status)
         guard let draft = probe.snapshot else { overlay.orderOut(nil); latest = nil; return }
         latest = draft
@@ -627,6 +681,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func scrollRefresh() {
         guard !visibleBubbles.isEmpty || hoverButtonPanel?.isVisible == true else { return }
         hideHoverButton()
+        // 在途扫描拿到的是滚动前的坐标，直接作废，让下扫描重新来。
+        scanGeneration += 1
         refreshVisibleBubbles()
     }
 
@@ -638,8 +694,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !paused, !suspended, desktopReady(), frontmost == WhatsAppBridge.bundleID else {
             visibleBubbles = []; hideHoverButton(); return
         }
-        visibleBubbles = model.bridge.scanMessages()
-        updateHoverButton()
+        // scanMessages 是一长串同步 AX 往返，留在主线程就会和后台 hit-test
+        // 互相锁死。同一时刻只允许一次在途扫描；结果回主线程时守卫重查一遍，
+        // 过期的直接丢弃，等下一个 tick 重新扫。
+        guard !scanInFlight else { return }
+        scanInFlight = true
+        scanGeneration += 1
+        let generation = scanGeneration
+        let bridge = model.bridge
+        axQueue.async { [weak self] in
+            let bubbles = bridge.scanMessages()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.scanInFlight = false
+                guard generation == self.scanGeneration,
+                      UserDefaults.standard.bool(forKey:"hoverTranslateEnabled"),
+                      !self.paused, !self.suspended, desktopReady(),
+                      NSWorkspace.shared.frontmostApplication?.bundleIdentifier == WhatsAppBridge.bundleID else { return }
+                self.visibleBubbles = bubbles
+                self.updateHoverButton()
+            }
+        }
     }
 
     private func appKitRect(_ rect: CGRect, primaryHeight: CGFloat) -> CGRect {
@@ -727,11 +802,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func requestNativeHoverAnchor(for hit: MessageBubble) {
         guard hoverButtonAnchor == nil, !hoverAnchorRequestInFlight else { return }
-        let generation = hoverAnchorGeneration
         hoverAnchorRequestInFlight = true
+        let generation = hoverAnchorGeneration
         let bridge = model.bridge
+        // hit-test 的网格点就分布在消息气泡旁，恰好也是我们自己的浮层占据的
+        // 区域。点到自己的窗口上，系统会把这次 hit-test 回投给本进程、还要
+        // 主线程来服务视图树——这是死锁的另一半。派发前把自己的可见窗口
+        // 记下来（两种坐标系各一份），让网格跳过它们。
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        var excluded: [CGRect] = []
+        for window in NSApp.windows where window.isVisible {
+            let frame = window.frame
+            excluded.append(frame)
+            excluded.append(CGRect(x:frame.minX,y:primaryHeight-frame.maxY,width:frame.width,height:frame.height))
+        }
         DispatchQueue.global(qos:.userInitiated).async { [weak self] in
-            let discovered = bridge.hoverActionAnchor(near:hit.rect)
+            let discovered = bridge.hoverActionAnchor(near:hit.rect,excluding:excluded)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.hoverAnchorRequestInFlight = false

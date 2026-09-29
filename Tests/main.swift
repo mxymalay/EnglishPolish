@@ -154,3 +154,22 @@ check(BubbleDescription.replyOwnDescription("消息, plain message, 上午9:00")
 check(BubbleDescription.parse("‎可能是Bob发来的消息, meeting moved, 星期四下午3:00, ‎在FIT5120 TM1")?.body == "meeting moved", "weekday timestamps stripped")
 check(BubbleDescription.parse("‎消息, see you there, 周四 14:22, ‎从xinhui收到")?.body == "see you there", "weekday plus clock time stripped")
 check(BubbleDescription.parse("‎可能是Bob发来的消息, 凌晨1点见, 上午1:15, ‎在FIT5120 TM1")?.body == "凌晨1点见", "time words inside the body survive")
+
+// MARK: AI 连接历史（AIProfileStore）
+let suiteName = "test-ai-profiles"
+let profileDefaults = UserDefaults(suiteName:suiteName)!
+profileDefaults.removePersistentDomain(forName:suiteName)
+check(AIProfileStore.load(profileDefaults).isEmpty, "profile store starts empty")
+var stored = AIProfileStore.upsert(AIProfile(endpoint:"https://a.example/v1",name:"A",model:"m1"),into:[])
+stored = AIProfileStore.upsert(AIProfile(endpoint:"https://b.example/v1",name:"B",model:"m2"),into:stored)
+stored = AIProfileStore.upsert(AIProfile(endpoint:"https://a.example/v1",name:"A2",model:"m3"),into:stored)
+check(stored.count == 2 && stored[0].name == "A2" && stored[0].model == "m3", "upsert keeps one entry per endpoint, newest first")
+check(stored[1].name == "B", "older profile stays after upsert")
+stored = AIProfileStore.remove(endpoint:"https://a.example/v1",from:stored)
+check(stored.count == 1 && stored[0].name == "B", "remove deletes by endpoint")
+AIProfileStore.save(stored,defaults:profileDefaults)
+check(AIProfileStore.load(profileDefaults) == stored, "profiles round-trip through defaults")
+check(AIProfileStore.displayName(endpoint:"https://api.example.com:8443/v1",name:"") == "api.example.com:8443", "unnamed profile falls back to host:port")
+check(AIProfileStore.displayName(endpoint:"https://api.example.com/v1",name:"  本机  ") == "本机", "display name trims whitespace")
+check(AIProfileStore.displayName(endpoint:"不是地址",name:"") == "不是地址", "unparsable endpoint shown verbatim")
+profileDefaults.removePersistentDomain(forName:suiteName)

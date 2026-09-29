@@ -6,11 +6,40 @@ import shutil
 import subprocess
 import sys
 import os
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent
 BUILD = ROOT / 'build'
 BUILD.mkdir(exist_ok=True)
 DESIGNATED_REQUIREMENT = '=designated => identifier "com.xy.english-polish"'
+INSTALLED = pathlib.Path.home() / 'Applications' / '轻语.app'
+RUNNING_PATTERN = 'Applications/轻语.app/Contents/MacOS/EnglishPolish'
+
+
+def running_pids():
+    result = subprocess.run(['pgrep','-f',RUNNING_PATTERN],capture_output=True,text=True)
+    return [int(pid) for pid in result.stdout.split()]
+
+
+def deploy(app):
+    """Every build updates the installed app in ~/Applications, replacing the
+    running copy (graceful quit first, SIGKILL for a hung instance) and
+    relaunching it only when it was running before."""
+    was_running = bool(running_pids())
+    if was_running:
+        subprocess.run(['osascript','-e','tell application id "com.xy.english-polish" to quit'],check=False)
+        for _ in range(40):
+            if not running_pids(): break
+            time.sleep(0.25)
+        for pid in running_pids():
+            subprocess.run(['kill','-9',str(pid)],check=False)
+        time.sleep(0.5)
+    if INSTALLED.exists():
+        shutil.rmtree(INSTALLED)
+    shutil.copytree(app,INSTALLED,symlinks=True)
+    print(f'installed -> {INSTALLED}')
+    if was_running:
+        subprocess.run(['open',INSTALLED],check=False)
 
 def run(*args, env=None):
     subprocess.run([str(arg) for arg in args], check=True, env=env)
@@ -74,8 +103,8 @@ else:
             'CFBundleExecutable': 'EnglishPolish',
             'CFBundlePackageType': 'APPL',
             'CFBundleIconFile': 'AppIcon.icns',
-            'CFBundleShortVersionString': '0.4.0',
-            'CFBundleVersion': '5',
+            'CFBundleShortVersionString': '0.4.3',
+            'CFBundleVersion': '8',
             'LSMinimumSystemVersion': '13.0',
             'LSUIElement': True,
             'NSHighResolutionCapable': True,
@@ -86,4 +115,5 @@ else:
     run('codesign','--force','--sign','-','--identifier','com.xy.english-polish',
         '--requirements',DESIGNATED_REQUIREMENT,app)
     run('codesign','--verify','--strict',app)
+    deploy(app)
     print(app)

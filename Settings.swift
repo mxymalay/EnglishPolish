@@ -78,17 +78,48 @@ struct GeneralSettingsPage:View {
 struct AISettingsPage:View {
     @State private var endpoint=UserDefaults.standard.string(forKey:"endpoint") ?? "https://api.openai.com/v1"
     @State private var model=UserDefaults.standard.string(forKey:"model") ?? ""
+    @State private var profileName=UserDefaults.standard.string(forKey:"profileName") ?? ""
     @State private var casualPrompt=UserDefaults.standard.string(forKey:"casualPrompt") ?? APIClient.defaultCasualPrompt
     @State private var formalPrompt=UserDefaults.standard.string(forKey:"formalPrompt") ?? APIClient.defaultFormalPrompt
-    @State private var key=""; @State private var message=""; @State private var saved=false
+    @State private var key=""
+    @State private var profiles:[AIProfile]=[]
+    @State private var selectedEndpoint:String?
+    @State private var hasSavedKey=false
+    @State private var testing=false
+    @State private var message=""; @State private var ok=true
+    @State private var promptMessage=""; @State private var promptOK=true
+    @State private var keyCheckTask:Task<Void,Never>?
+    @State private var testTask:Task<Void,Never>?
     var body:some View {
         Form {
             Section("连接 AI 服务") {
                 Text("润色时只发送本次草稿。历史记录不会发送，服务可能按用量收费。").foregroundStyle(.secondary)
-                TextField("服务地址",text:$endpoint).onChange(of:endpoint){ _ in key="";saved=false;message="服务已更换，请填写对应密钥。" }
+                if !profiles.isEmpty {
+                    HStack {
+                        Picker("历史连接",selection:$selectedEndpoint) {
+                            Text("手动输入").tag(String?.none)
+                            ForEach(profiles){ profile in
+                                Text(AIProfileStore.displayName(endpoint:profile.endpoint,name:profile.name)).tag(profile.endpoint as String?)
+                            }
+                        }.onChange(of:selectedEndpoint){ loadSelected($0) }
+                        if selectedEndpoint != nil {
+                            Button("删除",role:.destructive,action:deleteSelectedProfile).help("删除这条历史连接")
+                        }
+                    }
+                }
+                TextField("服务地址",text:$endpoint).onChange(of:endpoint){ _ in connectionChanged() }
                 TextField("模型名称",text:$model)
+                TextField("配置名称（可选，便于在历史里认出它）",text:$profileName)
                 SecureField("填写新密钥；留空保留已保存密钥",text:$key)
-                Text("密钥保存在 macOS 钥匙串中。服务必须支持 HTTPS Chat Completions JSON 模式。").font(.caption).foregroundStyle(.secondary)
+                Text(hasSavedKey ? "此地址已保存密钥，可以直接测试。" : "此地址还没有保存密钥。").font(.caption).foregroundStyle(hasSavedKey ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+                HStack {
+                    if testing { ProgressView().controlSize(.small) }
+                    Button(testing ? "取消测试" : "测试连接") { if testing { cancelTest() } else { testConnection() } }
+                    Spacer()
+                    Button("保存连接",action:saveConnection).buttonStyle(.borderedProminent).tint(.teal)
+                }
+                if !message.isEmpty { Text(message).font(.caption).foregroundStyle(ok ? .secondary:.primary) }
+                Text("密钥保存在 macOS 钥匙串中。服务须支持 Chat Completions（HTTPS，本机代理可用 http）。").font(.caption).foregroundStyle(.secondary)
             }
             Section("自定义提示词") {
                 Text("下面两个框分别控制候选框里的第一句和第二句。输出格式和原意保护规则由轻语继续管理。").font(.caption).foregroundStyle(.secondary)
@@ -101,22 +132,104 @@ struct AISettingsPage:View {
                 HStack {
                     Button("恢复两个默认提示词") { casualPrompt=APIClient.defaultCasualPrompt;formalPrompt=APIClient.defaultFormalPrompt }
                     Spacer()
-                    Button("保存 AI 设置",action:save).buttonStyle(.borderedProminent).tint(.teal)
+                    Button("保存提示词",action:savePrompts).buttonStyle(.borderedProminent).tint(.teal)
                 }
-                if !message.isEmpty { Text(message).font(.caption).foregroundStyle(saved ? .secondary:.primary) }
+                if !promptMessage.isEmpty { Text(promptMessage).font(.caption).foregroundStyle(promptOK ? .secondary:.primary) }
             }
-        }.formStyle(.grouped)
+        }.formStyle(.grouped).onAppear {
+            profiles=AIProfileStore.load()
+            selectedEndpoint=profiles.first(where:{$0.endpoint == currentEndpoint})?.endpoint
+            refreshSavedKey()
+        }
     }
-    private func save() {
+
+    private var currentEndpoint:String { endpoint.trimmingCharacters(in:.whitespacesAndNewlines) }
+    private var currentModel:String { model.trimmingCharacters(in:.whitespacesAndNewlines) }
+
+    // 服务地址变了：密钥字段清空，历史选中项跟着对上同地址的配置。
+    private func connectionChanged() {
+        key="";message=""
+        let match=profiles.first(where:{$0.endpoint == currentEndpoint})?.endpoint
+        if selectedEndpoint != match { selectedEndpoint=match }
+        refreshSavedKey()
+    }
+
+    private func loadSelected(_ selected:String?) {
+        guard let selected,let profile=profiles.first(where:{$0.endpoint == selected}),
+              profile.endpoint != currentEndpoint else { return }
+        endpoint=profile.endpoint; model=profile.model; profileName=profile.name
+        key="";message=""
+        refreshSavedKey()
+    }
+
+    private func deleteSelectedProfile() {
+        guard let selected=selectedEndpoint,
+              let profile=profiles.first(where:{$0.endpoint == selected}) else { return }
+        profiles=AIProfileStore.remove(endpoint:selected,from:profiles)
+        AIProfileStore.save(profiles)
+        selectedEndpoint=nil
+        ok=true;message="已删除「\(AIProfileStore.displayName(endpoint:profile.endpoint,name:profile.name))」。"
+    }
+
+    private func refreshSavedKey() {
+        keyCheckTask?.cancel()
+        let endpoint=currentEndpoint
+        keyCheckTask=Task { @MainActor in
+            try? await Task.sleep(nanoseconds:200_000_000)
+            guard !Task.isCancelled else { return }
+            let stored=(try? SecretStore.read(endpoint)) ?? ""
+            hasSavedKey = !stored.isEmpty
+        }
+    }
+
+    // 真实发一条最小润色请求：连通性、密钥、模型、JSON 输出格式一次验证完。
+    private func testConnection() {
+        let trimmedKey=key.trimmingCharacters(in:.whitespacesAndNewlines)
+        let configuration: APIConfiguration
         do {
-            let e=endpoint.trimmingCharacters(in:.whitespacesAndNewlines),m=model.trimmingCharacters(in:.whitespacesAndNewlines),k=key.trimmingCharacters(in:.whitespacesAndNewlines)
-            let effective=try k.isEmpty ? SecretStore.read(e):k
-            _=try APIClient.makeRequest(text:"Hello",configuration:APIConfiguration(endpoint:e,model:m,key:effective,casualPrompt:casualPrompt,formalPrompt:formalPrompt))
-            if !k.isEmpty { try SecretStore.save(k,endpoint:e) }
-            UserDefaults.standard.set(e,forKey:"endpoint");UserDefaults.standard.set(m,forKey:"model")
-            UserDefaults.standard.set(casualPrompt,forKey:"casualPrompt");UserDefaults.standard.set(formalPrompt,forKey:"formalPrompt")
-            key="";saved=true;message="已保存。"
-        } catch { saved=false;message=error.localizedDescription }
+            let effective=try trimmedKey.isEmpty ? SecretStore.read(currentEndpoint) : trimmedKey
+            configuration=APIConfiguration(endpoint:currentEndpoint,model:currentModel,key:effective,casualPrompt:casualPrompt,formalPrompt:formalPrompt)
+            _=try APIClient.makeRequest(text:"Hello",configuration:configuration)
+        } catch { ok=false;message=(error as? PolishError)?.message ?? error.localizedDescription; return }
+        testing=true;ok=true;message="正在测试连接…"
+        testTask=Task { @MainActor in
+            let started=Date()
+            do {
+                _=try await APIClient().polish("Hello",configuration:configuration)
+                let seconds=String(format:"%.1f",Date().timeIntervalSince(started))
+                ok=true;message="测试成功 · \(seconds) 秒"
+            } catch is CancellationError {
+                ok=true;message="已取消测试。"
+            } catch {
+                ok=false;message=(error as? PolishError)?.message ?? error.localizedDescription
+            }
+            testing=false
+        }
+    }
+
+    private func cancelTest() {
+        testTask?.cancel()
+    }
+
+    private func saveConnection() {
+        let trimmedKey=key.trimmingCharacters(in:.whitespacesAndNewlines)
+        do {
+            let effective=try trimmedKey.isEmpty ? SecretStore.read(currentEndpoint) : trimmedKey
+            _=try APIClient.makeRequest(text:"Hello",configuration:APIConfiguration(endpoint:currentEndpoint,model:currentModel,key:effective,casualPrompt:casualPrompt,formalPrompt:formalPrompt))
+            if !trimmedKey.isEmpty { try SecretStore.save(trimmedKey,endpoint:currentEndpoint) }
+            UserDefaults.standard.set(currentEndpoint,forKey:"endpoint");UserDefaults.standard.set(currentModel,forKey:"model")
+            profiles=AIProfileStore.upsert(AIProfile(endpoint:currentEndpoint,name:profileName,model:currentModel),into:profiles)
+            AIProfileStore.save(profiles)
+            selectedEndpoint=currentEndpoint
+            key="";hasSavedKey=true
+            ok=true;message="已保存，之后可以在「历史连接」里一键切换回来。"
+        } catch { ok=false;message=(error as? PolishError)?.message ?? error.localizedDescription }
+    }
+
+    private func savePrompts() {
+        UserDefaults.standard.set(casualPrompt,forKey:"casualPrompt")
+        UserDefaults.standard.set(formalPrompt,forKey:"formalPrompt")
+        promptOK=true;promptMessage="提示词已保存。"
     }
 }
 
